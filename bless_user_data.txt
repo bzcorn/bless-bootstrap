@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# Set Variables
+export AWS_REGION=""
+export BLESS_LAMBDA_FUNCTION_NAME=""
+export AWS_ACCOUNT_NUMBER=""
+export BLESS_LAMBDA_FUNCTION_ROLE_NAME="bless_lambda_role"
+# Get Bless
+yum install gcc libffi-devel openssl-devel git -y
+git clone https://github.com/Netflix/bless.git
+
+# Get all Bless components that don't require builds
+cd bless/
+virtualenv venv
+source venv/bin/activate
+make develop
+
+mkdir aws_lambda_libs
+
+cd ..
+mkdir -p compiles/bless
+
+cp bless/setup.py compiles/
+cp bless/bless/__about__.py compiles/bless
+deactivate
+
+# Create a directory to compile Python Cryptography
+cd compiles
+virtualenv venv
+source venv/bin/activate
+pip install --upgrade pip setuptools
+pip install -e .
+
+# Copy build files to Bless
+cp -r venv/lib/python2.7/site-packages/. ../bless/aws_lambda_libs
+cp -r venv/lib64/python2.7/site-packages/. ../bless/aws_lambda_libs
+
+cd ../bless
+
+# Install Credstash to grab CA password securely
+pip install credstash
+export PASS=$(credstash -r ${AWS_REGION} -t bless-store get bless-ca-password)
+export BLOB=$(aws kms encrypt --region ${AWS_REGION} --key-id alias/bless --plaintext "$PASS" --output text --query CiphertextBlob)
+
+# Create config direcotry and move config files to it
+mkdir lambda_configs
+cp bless/config/bless_deploy_example.cfg lambda_configs/bless_deploy.cfg
+
+# Massage bless_deploy to look like we need it to
+sed -i "/.*<KMS_ENCRYPTED_BASE64_ENCODED_PEM_PASSWORD_HERE>.*/cdefault_password = $BLOB" lambda_configs/bless_deploy.cfg
+sed -i "/.*<INSERT_YOUR_ENCRYPTED_PEM_FILE_NAME>.*/cca_private_key_file = bless-ca-01" lambda_configs/bless_deploy.cfg
+sed -i "/.*us-east.*/c#" lambda_configs/bless_deploy.cfg
+sed -i "/.*us-west.*/c#" lambda_configs/bless_deploy.cfg
+
+# Generate new CA keys and chmod them to read only
+ssh-keygen -t rsa -b 4096 -f lambda_configs/bless-ca-01 -C "SSH CA Key 01" -P $PASS
+ssh-keygen -t rsa -b 4096 -f lambda_configs/bless-ca-02 -C "SSH CA Key 02" -P $PASS
+ssh-keygen -t rsa -b 4096 -f lambda_configs/bless-ca-03 -C "SSH CA Key 03" -P $PASS
+chmod 444 lambda_configs/bless-ca-0*
+
+# Zip up all the things
+make publish
+# Place in easily scp-able location
+cp publish/bless_lambda.zip /tmp
+
+# Push CA Public keys to credstash for easy retrieval for other instances
+cat lambda_configs/*.pub >> /public.txt
+credstash -r eu-west-2 -t bless-store put -a -k alias/bless ssh-ca-public-keys "$(cat /public.txt)"
+
+aws lambda create-function \
+--region ${AWS_REGION} \
+--function-name ${BLESS_LAMBDA_FUNCTION_NAME} \
+--runtime python2.7 \
+--role arn:aws:iam::${AWS_ACCOUNT_NUMBER}:role/${BLESS_LAMBDA_FUNCTION_ROLE_NAME} \
+--handler bless_lambda.lambda_handler \
+--zip-file fileb:///tmp/bless_lambda.zip

@@ -1,0 +1,44 @@
+---
+
+- hosts: all
+  tasks:
+    - name: Create Lambda Role 
+      iam_role:
+        name: bless_lambda_role
+        assume_role_policy_document: "{{ lookup('file','trust_policies/lambda.json') }}"
+        managed_policy:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        state: present
+
+    - name: Create EC2 Role 
+      iam_role:
+        name: bless_ec2_role
+        assume_role_policy_document: "{{ lookup('file','trust_policies/ec2.json') }}"
+        managed_policy:
+          - arn:aws:iam::aws:policy/AWSLambdaFullAccess
+        state: present
+
+    - name: Set EC2 Role KMS key permissions
+      aws_kms:
+        mode: grant
+        clean_invalid_entries: yes
+        key_alias: "alias/bless"
+        role_name: "{{ item }}"
+        grant_types: "role"
+      with_items:
+        - bless_ec2_role
+        - bless_lambda_role
+
+    - name: Create EC2 Instance
+      ec2:
+        instance_type: t2.micro
+        key_name: infrastructure
+        instance_tags:
+            Name: bless compiler
+        region: eu-west-2
+        image: ami-704e5814
+        user_data: "{{ lookup('file', 'bless_user_data.txt') }}"
+        instance_profile_name: bless_ec2_role
+        wait: yes
+        count: 1
+      register: ec2
